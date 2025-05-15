@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.IO.Pipelines;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -15,6 +16,8 @@ namespace SuperSocket.Connection
     /// </summary>
     public class SocketSender : SocketAsyncEventArgs, IValueTaskSource<int>, IResettable
     {
+        private readonly PipeScheduler _pipeScheduler;
+
         private Action<object> _continuation;
 
         private static readonly Action<object> _continuationCompleted = _ => { };
@@ -25,8 +28,17 @@ namespace SuperSocket.Connection
         /// Initializes a new instance of the <see cref="SocketSender"/> class.
         /// </summary>
         public SocketSender()
+            : this(PipeScheduler.Inline)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SocketSender"/> class.
+        /// </summary>
+        public SocketSender(PipeScheduler pipeScheduler)
             : base(unsafeSuppressExecutionContextFlow: true)
         {
+            _pipeScheduler = pipeScheduler;
         }
 
         /// <summary>
@@ -82,15 +94,22 @@ namespace SuperSocket.Connection
         {
             var continuation = Interlocked.CompareExchange(ref _continuation, _continuationCompleted, null);
 
-            // Trigger continuation action if it is set.
-            if (continuation != null)
+            if (continuation == null)
             {
-                var state = UserToken;
-                _continuation = _continuationCompleted;
-                ThreadPool.UnsafeQueueUserWorkItem(continuation, state, false);
+                // If the continuation is null, it means no continuation action to invoke
+                // and the user token should be cleared if it was set.
+                UserToken = null;
+                return;
             }
 
+            var state = UserToken;
+
+            // Clear the UserToken to avoid being used twice
             UserToken = null;
+            // Set the continuation to completed before queueing the work item
+            _continuation = _continuationCompleted;
+
+            _pipeScheduler.Schedule(continuation, state);
         }
 
         /// <summary>
@@ -100,7 +119,9 @@ namespace SuperSocket.Connection
         /// <returns>The number of bytes transferred.</returns>
         public int GetResult(short token)
         {
+            // Clear both continuation and state
             _continuation = null;
+            UserToken = null;
             return BytesTransferred;
         }
 
@@ -128,14 +149,19 @@ namespace SuperSocket.Connection
         /// <param name="flags">Flags that control the behavior of the continuation.</param>
         public void OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
         {
+            // Store the state first
             UserToken = state;
-
+            
+            // Try to set the continuation
             var prevContinuation = Interlocked.CompareExchange(ref _continuation, continuation, null);
 
-            // The task has already completed, so trigger continuation immediately
+            // If the operation has already completed, the continuation would be _continuationCompleted
             if (ReferenceEquals(prevContinuation, _continuationCompleted))
             {
+                // Clear the state since we'll invoke the continuation directly
                 UserToken = null;
+                
+                // Queue the continuation with preferLocal=true for better performance
                 ThreadPool.UnsafeQueueUserWorkItem(continuation, state, preferLocal: true);
             }
         }
